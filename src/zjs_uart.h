@@ -5,6 +5,6 @@
 
 void zjs_service_uart(void);
 
-jerry_object_t* zjs_uart_init(void);
+jerry_value_t zjs_uart_init(void);
 
 #endif /* SRC_ZJS_UART_H_ */

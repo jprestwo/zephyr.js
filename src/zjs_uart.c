@@ -13,7 +13,7 @@ static int position = 0;
 static char uartBuf[UART_BUFFER_SIZE];
 
 // Global UART pin object (since there is only one UART)
-static jerry_object_t* uart_pin = NULL;
+static jerry_value_t uart_pin = NULL;
 
 // This is the CB ID for the C callback. This should not have to be a
 // global ID but the UART API's do not let you add a "handle" that is
@@ -25,7 +25,7 @@ static int32_t uart_cb_id = -1;
 // string data, and callback ID so everything can be
 // properly cleaned up after the callback is made
 struct uart_cb_data {
-    jerry_object_t* onread_func;
+    jerry_value_t onread_func;
     int32_t onread_id;
 };
 
@@ -86,7 +86,7 @@ static void uart_c_callback(void* handle)
         // Alloc for the saved char's
         jerry_value_t data_val[1];
         // Create a jerry string
-        jerry_string_t *string  = jerry_create_string_sz(uartBuf, position);
+        jerry_char_t* string  = jerry_create_string_sz(uartBuf, position);
         jerry_value_t string_value = jerry_create_string_value(string);
         // Aquire the string
         jerry_value_t string_ret = jerry_acquire_value(string_value);
@@ -119,15 +119,14 @@ static void uart_c_callback(void* handle)
 }
 
 // Write a string to UART
-static bool uart_write(const jerry_object_t *function_obj_p,
+static jerry_value_t uart_write(const jerry_value_t function_obj_val,
                        const jerry_value_t this_val,
                        const jerry_value_t args_p[],
-                       const jerry_length_t args_cnt,
-                       jerry_value_t *ret_val_p)
+                       const jerry_length_t args_cnt)
 {
     char* input_string;
     int i;
-    jerry_string_t* data = jerry_get_string_value(args_p[0]);
+    jerry_char_t* data = jerry_get_string_value(args_p[0]);
     jerry_size_t len = jerry_get_string_size(data);
 
     input_string = task_malloc(sizeof(char*) * len + 1);
@@ -148,15 +147,14 @@ static bool uart_write(const jerry_object_t *function_obj_p,
 
     task_free(input_string);
 
-    return true;
+    return ZJS_UNDEFINED;
 }
 
 // Open a UART pin, returns a UART pin object
-bool zjs_uart_open(const jerry_object_t *function_obj_p,
+jerry_value_t zjs_uart_open(const jerry_value_t function_obj_p,
                    const jerry_value_t this_val,
                    const jerry_value_t args_p[],
-                   const jerry_length_t args_cnt,
-                   jerry_value_t *ret_val_p)
+                   const jerry_length_t args_cnt)
 {
     DBG_PRINT("[uart] zjs_uart_open(): Opening UART\n");
     // This handle is not entirely needed, since we save the ID globally,
@@ -175,13 +173,11 @@ bool zjs_uart_open(const jerry_object_t *function_obj_p,
 
     zjs_obj_add_function(uart_pin, uart_write, "write");
 
-    *ret_val_p = uart_pin_val;
-
-    return true;
+    return uart_pin_val;
 }
 
 // Initialize UART, returns the UART object from require('uart')
-jerry_object_t* zjs_uart_init(void)
+jerry_value_t zjs_uart_init(void)
 {
     uart_dev = device_get_binding("UART_0");
     if (!uart_dev) {
@@ -192,7 +188,7 @@ jerry_object_t* zjs_uart_init(void)
     uart_irq_callback_set(uart_dev, uart_irq_handler);
     uart_irq_rx_enable(uart_dev);
 
-    jerry_object_t *uart_obj = jerry_create_object();
+    jerry_value_t uart_obj = jerry_create_object();
     zjs_obj_add_function(uart_obj, zjs_uart_open, "open");
 
     return uart_obj;
