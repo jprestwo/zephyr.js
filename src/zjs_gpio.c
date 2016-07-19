@@ -42,8 +42,9 @@ struct gpio_handle {
 static void gpio_c_callback(void* h)
 {
     struct gpio_handle *handle = (struct gpio_handle*)h;
-    jerry_value_t onchange_func = jerry_get_object_field_value(handle->pin_obj,
-                (const jerry_char_t *)"onChange");
+    jerry_value_t onchange_func = zjs_get_property(handle->pin_obj, "onChange");
+
+
     // If pin.onChange exists, call it
     if (jerry_value_is_function(onchange_func)) {
         jerry_value_t args[1];
@@ -59,10 +60,11 @@ static void gpio_c_callback(void* h)
         // Only aquire once, once we have it just keep using it.
         // It will be released in close()
         if (!handle->onchange_func) {
-            handle->onchange_func = jerry_acquire_object(jerry_get_object_value(onchange_func));
+            handle->onchange_func = jerry_acquire_value(onchange_func);
         }
+        jerry_value_t this_val = jerry_create_undefined();
         // Call the JS callback
-        jerry_call_function(handle->onchange_func, NULL, args, 1);
+        jerry_call_function(handle->onchange_func, this_val, args, 1);
     } else {
         DBG_PRINT("onChange has not been registered\n");
     }
@@ -163,7 +165,7 @@ static bool zjs_gpio_pin_close(const jerry_value_t function_obj_p,
         if (handle) {
             zjs_remove_callback(handle->callbackId);
             if (handle->onchange_func) {
-                jerry_release_object(handle->onchange_func);
+                jerry_release_value(handle->onchange_func);
             }
             task_free(handle);
         }
