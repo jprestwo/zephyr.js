@@ -6,10 +6,13 @@
 // import gpio module
 var gpio = require("gpio");
 var pins = require("arduino101_pins");
-
-var led = gpio.open({pin: pins.LED0, direction: 'out'});
-var button = gpio.open({pin: pins.IO4, direction: 'in', edge: 'any'});
-
-button.onChange = function(event) {
-    print("Button changed");
-}
+print("opening GPIO");
+//var led = gpio.open({pin: pins.LED0, direction: 'out'});
+gpio.open({pin: pins.IO4, direction: 'in', edge: 'any'}).then(function(pin) {
+	print("Promise fulfilled");
+	pin.onChange = function(event) {
+		print("Button changed");
+	};
+}).docatch(function(error) {
+	print("Error opening GPIO pin");
+});

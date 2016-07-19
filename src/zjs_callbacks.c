@@ -74,6 +74,11 @@ void zjs_init_callbacks(void)
     return;
 }
 
+void zjs_edit_js_func(int32_t id, jerry_value_t func)
+{
+    cb_map[id]->js->js_func = func;
+}
+
 int32_t zjs_add_callback(jerry_value_t js_func,
                          void* handle,
                          zjs_pre_callback_func pre,
@@ -89,7 +94,7 @@ int32_t zjs_add_callback(jerry_value_t js_func,
     new_cb->type = CALLBACK_TYPE_JS;
     new_cb->signal = 0;
     new_cb->js->id = new_id();
-    new_cb->js->js_func = js_func;
+    new_cb->js->js_func = jerry_acquire_value(js_func);
     new_cb->js->pre = pre;
     new_cb->js->post = post;
     new_cb->js->handle = handle;
@@ -163,7 +168,7 @@ void zjs_service_callbacks(void)
     for (i = 0; i < cb_size; i++) {
         if (cb_map[i]->signal) {
             cb_map[i]->signal = 0;
-            if (cb_map[i]->type == CALLBACK_TYPE_JS && cb_map[i]->js->js_func) {
+            if (cb_map[i]->type == CALLBACK_TYPE_JS && jerry_value_is_function(cb_map[i]->js->js_func)) {
                 uint32_t args_cnt = 0;
                 jerry_value_t ret_val;
                 jerry_value_t* args = NULL;
@@ -174,7 +179,8 @@ void zjs_service_callbacks(void)
 
                 DBG_PRINT("[callbacks] zjs_service_callbacks(): Calling callback id %u with %u args\n", cb_map[i]->js->id, args_cnt);
                 // TODO: Use 'this' in callback module
-                jerry_call_function(cb_map[i]->js->js_func, NULL, args, args_cnt);
+                jerry_call_function(cb_map[i]->js->js_func, ZJS_UNDEFINED, args, args_cnt);
+
                 if (cb_map[i]->js->post) {
                     cb_map[i]->js->post(cb_map[i]->js->handle, &ret_val);
                 }
