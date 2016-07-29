@@ -14,6 +14,7 @@
 #include "zjs_buffer.h"
 #include "zjs_callbacks.h"
 #include "zjs_common.h"
+#include "zjs_flash.h"
 #include "zjs_gpio.h"
 #include "zjs_modules.h"
 #include "zjs_pwm.h"
@@ -42,6 +43,7 @@ void main(int argc, char *argv[])
 #ifndef QEMU_BUILD
     zjs_modules_add("aio", zjs_aio_init);
     zjs_modules_add("ble", zjs_ble_init);
+    zjs_modules_add("fs", zjs_flash_init);
     zjs_modules_add("gpio", zjs_gpio_init);
     zjs_modules_add("pwm", zjs_pwm_init);
     zjs_modules_add("arduino101_pins", zjs_a101_init);

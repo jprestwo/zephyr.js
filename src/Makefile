@@ -11,6 +11,7 @@ obj-y += main.o \
          zjs_ble.o \
          zjs_buffer.o \
          zjs_callbacks.o \
+         zjs_flash.o \
          zjs_gpio.o \
          zjs_ipm.o \
          zjs_modules.o \
