@@ -82,6 +82,7 @@ static struct zjs_timer_t* add_timer(uint32_t interval,
  */
 static bool delete_timer(int32_t id)
 {
+    PRINT("Deleting\n");
     for (struct zjs_timer_t **ptm = &zjs_timers; *ptm; ptm = &(*ptm)->next) {
         struct zjs_timer_t *tm = *ptm;
         if (id == tm->callback_id) {
