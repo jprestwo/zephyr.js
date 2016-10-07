@@ -93,7 +93,7 @@ ocf-lib: setup $(OBJS)
 
 .PHONY: clean
 clean:
-	rm $(OBJS)
-	rm libocf.a
+	rm -f $(OBJS)
+	rm -f libocf.a
 
 

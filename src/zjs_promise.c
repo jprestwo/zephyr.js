@@ -155,7 +155,7 @@ void zjs_fulfill_promise(jerry_value_t obj, jerry_value_t argv[], uint32_t argc)
     jerry_value_t promise_obj = zjs_get_property(obj, "promise");
 
     if (!jerry_value_is_object(promise_obj)) {
-        ERR_PRINT("'promise' not found in object %u\n", obj);
+        ERR_PRINT("'promise' not found in object %lu\n", obj);
         return;
     }
 
