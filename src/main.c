@@ -1,68 +1,151 @@
 // Copyright (c) 2016, Intel Corporation.
-
+#ifndef ZJS_LINUX_BUILD
 // Zephyr includes
 #include <zephyr.h>
-
+#include "zjs_zephyr_time.h"
+#else
+#include "zjs_linux_time.h"
+#endif // ZJS_LINUX_BUILD
 #include <string.h>
+#include "zjs_script.h"
 
 // JerryScript includes
-#include "jerry.h"
 #include "jerry-api.h"
 
-// ZJS includes
-#include "zjs_aio.h"
-#include "zjs_ble.h"
+#ifdef ZJS_POOL_CONFIG
+#include "zjs_pool.h"
+#endif
+
+// Platform agnostic modules/headers
 #include "zjs_buffer.h"
-#include "zjs_gpio.h"
+#include "zjs_callbacks.h"
+#include "zjs_common.h"
+#include "zjs_event.h"
 #include "zjs_modules.h"
-#include "zjs_pwm.h"
 #include "zjs_timers.h"
 #include "zjs_util.h"
-#include "zjs_a101_pins.h"
+#ifdef BUILD_MODULE_OCF
+#include "zjs_ocf_common.h"
+#endif
 
-// local includes
-#include "script.h"
+extern const char *script_gen;
 
-void main(int argc, char *argv[])
+// native eval handler
+static jerry_value_t native_eval_handler(const jerry_value_t function_obj,
+                                         const jerry_value_t this,
+                                         const jerry_value_t argv[],
+                                         const jerry_length_t argc)
 {
-    jerry_object_t *err_obj_p = NULL;
-    jerry_value_t res;
+    return zjs_error("native_eval_handler: eval not supported");
+}
 
-    jerry_init(JERRY_FLAG_EMPTY);
+#ifndef ZJS_LINUX_BUILD
+void main(void)
+#else
+int main(int argc, char *argv[])
+#endif
+{
+    const char *script = NULL;
+    jerry_value_t code_eval;
+    jerry_value_t result;
+    uint32_t len;
+
+    // print newline here to make it easier to find
+    // the beginning of the program
+    PRINT("\n");
+
+#ifdef ZJS_POOL_CONFIG
+    zjs_init_mem_pools();
+#ifdef DUMP_MEM_STATS
+    zjs_print_pools();
+#endif
+#endif
+
+    jerry_init(JERRY_INIT_EMPTY);
 
     zjs_timers_init();
+#ifndef ZJS_LINUX_BUILD
     zjs_queue_init();
+#endif
+#ifdef BUILD_MODULE_BUFFER
     zjs_buffer_init();
+#endif
+    zjs_init_callbacks();
 
     // initialize modules
     zjs_modules_init();
-    zjs_modules_add("aio", zjs_aio_init);
-    zjs_modules_add("ble", zjs_ble_init);
-    zjs_modules_add("gpio", zjs_gpio_init);
-    zjs_modules_add("pwm", zjs_pwm_init);
-    zjs_modules_add("arduino101_pins", zjs_a101_init);
 
-    size_t len = strlen((char *) script);
+#ifdef BUILD_MODULE_OCF
+    zjs_register_service_routine(NULL, main_poll_routine);
+#endif
 
-    if (!jerry_parse((jerry_char_t *) script, len, &err_obj_p)) {
+#ifdef ZJS_LINUX_BUILD
+    if (argc > 1) {
+        zjs_read_script(argv[1], &script, &len);
+    } else
+    // slightly tricky: reuse next section as else clause
+#endif
+    {
+        script = script_gen;
+        len = strnlen(script_gen, MAX_SCRIPT_SIZE);
+        if (len == MAX_SCRIPT_SIZE) {
+            PRINT("Error: Script size too large! Increase MAX_SCRIPT_SIZE.\n");
+            goto error;
+        }
+    }
+
+    jerry_value_t global_obj = jerry_get_global_object();
+
+    // Todo: find a better solution to disable eval() in JerryScript.
+    // For now, just inject our eval() function in the global space
+    zjs_obj_add_function(global_obj, native_eval_handler, "eval");
+
+    code_eval = jerry_parse((jerry_char_t *)script, len, false);
+    if (jerry_value_has_error_flag(code_eval)) {
         PRINT("JerryScript: cannot parse javascript\n");
-        return;
+        goto error;
     }
 
-    if (jerry_run(&res) != JERRY_COMPLETION_CODE_OK) {
+#ifdef ZJS_LINUX_BUILD
+    if (argc > 1) {
+        zjs_free_script(script);
+    }
+#endif
+
+    result = jerry_run(code_eval);
+    if (jerry_value_has_error_flag(result)) {
         PRINT("JerryScript: cannot run javascript\n");
-        return;
+        goto error;
     }
 
+    jerry_release_value(global_obj);
+    jerry_release_value(code_eval);
+    jerry_release_value(result);
+
+#ifndef ZJS_LINUX_BUILD
+#ifndef QEMU_BUILD
+#ifdef BUILD_MODULE_BLE
     zjs_ble_enable();
+#endif
+#endif
+#endif // ZJS_LINUX_BUILD
 
     while (1) {
         zjs_timers_process_events();
-        // sleep here temporary fixes the BLE bug
-        task_sleep(100);
+#ifndef ZJS_LINUX_BUILD
         zjs_run_pending_callbacks();
+#endif
+        zjs_service_callbacks();
+        zjs_service_routines();
         // not sure if this is okay, but it seems better to sleep than
         //   busy wait
-        task_sleep(1);
+        zjs_sleep(1);
     }
+
+error:
+#ifdef ZJS_LINUX_BUILD
+    return 1;
+#else
+    return;
+#endif
 }

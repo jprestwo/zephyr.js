@@ -1,166 +1,220 @@
 // Copyright (c) 2016, Intel Corporation.
 
+#ifndef ZJS_LINUX_BUILD
 // Zephyr includes
 #include <zephyr.h>
+#include "zjs_zephyr_time.h"
+#else
+#include "zjs_linux_time.h"
+#endif
 
 #include <string.h>
 
 // JerryScript includes
-#include "jerry.h"
 #include "jerry-api.h"
 
 // ZJS includes
 #include "zjs_util.h"
+#include "zjs_callbacks.h"
 
-struct zjs_timer_t {
-    struct nano_timer timer;
+typedef struct zjs_timer {
+    zjs_port_timer_t timer;
     void *timer_data;
+    jerry_value_t* argv;
+    uint32_t argc;
     uint32_t interval;
+    int32_t callback_id;
     bool repeat;
-    struct zjs_callback zjs_cb;
-    struct zjs_timer_t *next;
-};
+    bool completed;
+    struct zjs_timer *next;
+} zjs_timer_t;
 
-static struct zjs_timer_t *zjs_timers = NULL;
+static zjs_timer_t *zjs_timers = NULL;
 
-static void zjs_timer_call_function(struct zjs_callback *cb)
+jerry_value_t* pre_timer(void* h, uint32_t* argc)
 {
-    // requires: called only from task context
-    //  effects: handles execution of the JS callback when ready
-    jerry_value_t rval = jerry_call_function(cb->js_callback, NULL, NULL, 0);
-    if (jerry_value_is_error(rval)) {
-        PRINT("error: zjs_timer_call_function\n");
-    }
-    jerry_release_value(rval);
+    zjs_timer_t* handle = (zjs_timer_t*)h;
+    *argc = handle->argc;
+    return handle->argv;
 }
 
-static jerry_object_t *
-add_timer(uint32_t interval,
-          jerry_object_t *callback,
-          bool repeat)
+/*
+ * Allocate a new timer and add it to list
+ *
+ * interval     Time until expiration (in ticks)
+ * callback     JS callback function
+ * repeat       Timeout or interval timer
+ * argv         Array of arguments to pass to timer callback function
+ * argc         Number of arguments in argv
+ */
+static zjs_timer_t* add_timer(uint32_t interval,
+                              jerry_value_t callback,
+                              jerry_value_t this,
+                              bool repeat,
+                              const jerry_value_t argv[],
+                              uint32_t argc)
 {
-    // requires: interval is the time in ticks until expiration; callback is
-    //             a JS callback function; repeat is true if the timer
-    //             should be repeated until canceled, false if one-shot
-    // effects: allocates a new timer item and adds it to the timers list
-    struct zjs_timer_t *tm;
-    tm = task_malloc(sizeof(struct zjs_timer_t));
+    int i;
+    zjs_timer_t *tm;
+
+    tm = zjs_malloc(sizeof(zjs_timer_t));
     if (!tm) {
-        PRINT("error: out of memory allocating timer struct\n");
+        PRINT("add_timer: out of memory allocating timer struct\n");
         return NULL;
     }
 
-    nano_timer_init(&tm->timer, &tm->timer_data);
-    tm->zjs_cb.js_callback = jerry_acquire_object(callback);
-    tm->zjs_cb.call_function = zjs_timer_call_function;
+    zjs_port_timer_init(&tm->timer, &tm->timer_data);
     tm->interval = interval;
     tm->repeat = repeat;
+    tm->completed = false;
     tm->next = zjs_timers;
+    tm->callback_id = zjs_add_callback(callback, this, tm, pre_timer, NULL);
+    tm->argc = argc;
+    tm->argv = zjs_malloc(sizeof(jerry_value_t) * argc);
+    for (i = 0; i < argc; ++i) {
+        tm->argv[i] = jerry_acquire_value(argv[i + 2]);
+    }
+
     zjs_timers = tm;
 
-    nano_timer_start(&tm->timer, interval);
-    return tm->zjs_cb.js_callback;
+    zjs_port_timer_start(&tm->timer, interval);
+    return tm;
 }
 
-static bool
-delete_timer(jerry_object_t *obj)
+/*
+ * Remove a timer from the list
+ *
+ * id           ID of timer, returned from add_timer
+ *
+ * returns      True if the timer was removed successfully (if the ID is valid)
+ */
+static bool delete_timer(int32_t id)
 {
-    // requires: obj is a pointer to a callback object reference acquired in
-    //             add_timer earlier
-    //  effects: removes the timer from the list and cleans up associated
-    //             memory/resources; returns true if associated timer found and
-    //             removed, false otherwise
-    for (struct zjs_timer_t **ptm = &zjs_timers; *ptm; ptm = &(*ptm)->next) {
-        struct zjs_timer_t *tm = *ptm;
-        if (obj == tm->zjs_cb.js_callback) {
-            jerry_release_object(tm->zjs_cb.js_callback);
-            nano_task_timer_stop(&tm->timer);
+    for (zjs_timer_t **ptm = &zjs_timers; *ptm; ptm = &(*ptm)->next) {
+        zjs_timer_t *tm = *ptm;
+        if (id == tm->callback_id) {
+            int i;
+            zjs_port_timer_stop(&tm->timer);
             *ptm = tm->next;
-            task_free(tm);
+            for (i = 0; i < tm->argc; ++i) {
+                jerry_release_value(tm->argv[i]);
+            }
+            zjs_remove_callback(tm->callback_id);
+            zjs_free(tm->argv);
+            zjs_free(tm);
             return true;
         }
-    };
+    }
     return false;
 }
 
-// native setInterval handler
-static bool
-native_set_interval_handler(const jerry_object_t *function_obj_p,
-                            const jerry_value_t this_val,
-                            const jerry_value_t args_p[],
-                            const jerry_length_t args_cnt,
-                            jerry_value_t *ret_val_p)
+static jerry_value_t add_timer_helper(const jerry_value_t function_obj,
+                                      const jerry_value_t this,
+                                      const jerry_value_t argv[],
+                                      const jerry_length_t argc,
+                                      bool repeat)
 {
-    if (args_cnt < 2 || !jerry_value_is_function(args_p[0]) ||
-                        !jerry_value_is_number(args_p[1])) {
-        PRINT ("native_set_interval_handler: invalid arguments\n");
-        return false;
-    }
+    if (argc < 2 || !jerry_value_is_function(argv[0]) ||
+            !jerry_value_is_number(argv[1]))
+        return zjs_error("native_set_interval_handler: invalid arguments");
 
-    uint32_t interval = (uint32_t)(jerry_get_number_value(args_p[1]) / 1000 *
-                                   CONFIG_SYS_CLOCK_TICKS_PER_SEC);
-    jerry_object_t *callback = jerry_get_object_value(args_p[0]);
+    uint32_t interval = (uint32_t)(jerry_get_number_value(argv[1]) / 1000 *
+            CONFIG_SYS_CLOCK_TICKS_PER_SEC);
+    jerry_value_t callback = argv[0];
+    jerry_value_t timer_obj = jerry_create_object();
 
-    jerry_object_t *tid = add_timer(interval, callback, true);
-    if (!tid) {
-        // TODO: should throw an exception
-        PRINT ("Error: timer alloc failed\n");
-        return false;
-    }
+    zjs_timer_t* handle = add_timer(interval, callback, this, repeat, argv, argc - 2);
+    if (handle->callback_id == -1)
+        return zjs_error("native_set_interval_handler: timer alloc failed");
+    jerry_set_object_native_handle(timer_obj, (uintptr_t)handle, NULL);
 
-    // FIXME: see if we can't return a real pointer to our struct here somehow
-    //   because it's unambiguous
-    zjs_init_value_object(ret_val_p, tid);
-    return true;
+    return timer_obj;
 }
 
 // native setInterval handler
-static bool
-native_clear_interval_handler(const jerry_object_t *function_obj_p,
-                              const jerry_value_t this_val,
-                              const jerry_value_t args_p[],
-                              const jerry_length_t args_cnt,
-                              jerry_value_t *ret_val_p)
+static jerry_value_t native_set_interval_handler(const jerry_value_t function_obj,
+                                                 const jerry_value_t this,
+                                                 const jerry_value_t argv[],
+                                                 const jerry_length_t argc)
 {
-    if (!jerry_value_is_object(args_p[0])) {
+    return add_timer_helper(function_obj,
+                            this,
+                            argv,
+                            argc,
+                            true);
+}
+
+// native setInterval handler
+static jerry_value_t native_set_timeout_handler(const jerry_value_t function_obj,
+                                                const jerry_value_t this,
+                                                const jerry_value_t argv[],
+                                                const jerry_length_t argc)
+{
+    return add_timer_helper(function_obj,
+                            this,
+                            argv,
+                            argc,
+                            false);
+}
+
+// native clearInterval handler
+static jerry_value_t native_clear_interval_handler(const jerry_value_t function_obj,
+                                                   const jerry_value_t this,
+                                                   const jerry_value_t argv[],
+                                                   const jerry_length_t argc)
+{
+    jerry_value_t timer_obj = argv[0];
+    zjs_timer_t* handle;
+
+    if (!jerry_value_is_object(argv[0])) {
         PRINT ("native_clear_interval_handler: invalid arguments\n");
-        return false;
+        return jerry_create_undefined();
     }
 
-    jerry_object_t *tid = jerry_get_object_value(args_p[0]);
-
-    if (!delete_timer(tid)) {
-        // TODO: should throw an exception
-        PRINT ("Error: timer not found\n");
-        return false;
+    if (!jerry_get_object_native_handle(timer_obj, (uintptr_t*)&handle)) {
+        return zjs_error("native_clear_interval_handler(): native handle not found");
     }
 
-    return true;
+    if (!delete_timer(handle->callback_id))
+        return zjs_error("native_clear_interval_handler: timer not found");
+
+    return jerry_create_undefined();
 }
 
 void zjs_timers_process_events()
 {
-    for (struct zjs_timer_t *tm = zjs_timers; tm; tm = tm->next) {
-        if (nano_task_timer_test(&tm->timer, TICKS_NONE)) {
-            // timer has expired, queue up callback
-            zjs_queue_callback(&tm->zjs_cb);
+    for (zjs_timer_t *tm = zjs_timers; tm; tm = tm->next) {
+        if (tm->completed) {
+            delete_timer(tm->callback_id);
+        }
+        else if (zjs_port_timer_test(&tm->timer, ZJS_TICKS_NONE)) {
+            // timer has expired, signal the callback
+            zjs_signal_callback(tm->callback_id);
 
             // reschedule or remove timer
-            if (tm->repeat)
-                nano_timer_start(&tm->timer, tm->interval);
-            else
-                delete_timer(tm->zjs_cb.js_callback);
+            if (tm->repeat) {
+                zjs_port_timer_start(&tm->timer, tm->interval);
+            } else {
+                // delete this timer next time around
+                tm->completed = true;
+            }
         }
     }
 }
 
 void zjs_timers_init()
 {
-    jerry_object_t *global_obj = jerry_get_global();
+    jerry_value_t global_obj = jerry_get_global_object();
 
     // create the C handler for setInterval JS call
-    zjs_obj_add_function(global_obj, native_set_interval_handler, "setInterval");
-
+    zjs_obj_add_function(global_obj, native_set_interval_handler,
+                         "setInterval");
     // create the C handler for clearInterval JS call
-    zjs_obj_add_function(global_obj, native_clear_interval_handler, "clearInterval");
+    zjs_obj_add_function(global_obj, native_clear_interval_handler,
+                         "clearInterval");
+    // create the C handler for setTimeout JS call
+    zjs_obj_add_function(global_obj, native_set_timeout_handler, "setTimeout");
+    // create the C handler for clearTimeout JS call (same as clearInterval)
+    zjs_obj_add_function(global_obj, native_clear_interval_handler,
+                         "clearTimeout");
 }

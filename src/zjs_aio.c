@@ -1,230 +1,333 @@
 // Copyright (c) 2016, Intel Corporation.
-
+#ifdef BUILD_MODULE_AIO
+#ifndef QEMU_BUILD
 // Zephyr includes
 #include <misc/util.h>
 #include <string.h>
 
 // ZJS includes
 #include "zjs_aio.h"
+#include "zjs_callbacks.h"
 #include "zjs_ipm.h"
 #include "zjs_util.h"
 
-DEFINE_SEMAPHORE(SEM_AIO_BLOCK);
+#define ZJS_AIO_TIMEOUT_TICKS                      500
 
-/*
- * The analog input pin and channel number mapping
- * for Arduino 101 board.
- * A0 Channel 10
- * A1 Channel 11
- * A2 Channel 12
- * A3 Channel 13
- * A4 Channel 14
- * A5 Channel 15
- */
-#define A0 10
-#define A1 11
-#define A2 12
-#define A3 13
-#define A4 14
-#define A5 15
+static struct nano_sem aio_sem;
 
-static uint32_t pin_values[6] = {};
+#define MAX_TYPE_LEN 20
 
-struct zjs_cb_list_item {
-    char event_type[20];
-    jerry_object_t *pin_obj;
-    struct zjs_callback zjs_cb;
+typedef struct aio_handle {
+    jerry_value_t pin_obj;
+    int32_t callback_id;
     double value;
-    struct zjs_cb_list_item *next;
-};
+    jerry_value_t jvalue;
+} aio_handle_t;
 
-static struct zjs_cb_list_item *zjs_cb_list = NULL;
-
-static struct zjs_cb_list_item *zjs_aio_callback_alloc()
+static aio_handle_t *zjs_aio_alloc_handle()
 {
-    // effects: allocates a new callback list item and adds it to the list
-    struct zjs_cb_list_item *item;
-    item = task_malloc(sizeof(struct zjs_cb_list_item));
-    if (!item) {
-        PRINT("error: out of memory allocating callback struct\n");
+    size_t size = sizeof(aio_handle_t);
+    aio_handle_t *handle = zjs_malloc(size);
+    if (handle) {
+        memset(handle, 0, size);
+    }
+    return handle;
+}
+
+static void zjs_aio_free_handle(aio_handle_t *handle)
+{
+    zjs_free(handle);
+}
+
+static zjs_ipm_message_t* zjs_aio_alloc_msg()
+{
+    zjs_ipm_message_t *msg = zjs_malloc(sizeof(zjs_ipm_message_t));
+    if (!msg) {
+        PRINT("zjs_aio_alloc_msg: cannot allocate message\n");
         return NULL;
     } else {
-        memset(item, 0, sizeof(struct zjs_cb_list_item));
+        memset(msg, 0, sizeof(zjs_ipm_message_t));
     }
 
-    item->next = zjs_cb_list;
-    zjs_cb_list = item;
-    return item;
+    msg->id = MSG_ID_AIO;
+    msg->flags = 0 | MSG_SAFE_TO_FREE_FLAG;
+    msg->error_code = ERROR_IPM_NONE;
+    return msg;
 }
 
-static void zjs_aio_callback_free(uintptr_t handle)
+static void zjs_aio_free_msg(zjs_ipm_message_t* msg)
 {
-    // requires: handle is the native pointer we registered with
-    //             jerry_set_object_native_handle
-    //  effects: frees the callback list item for the given pin object
-    struct zjs_cb_list_item **pItem = &zjs_cb_list;
-    while (*pItem) {
-        if ((uintptr_t)*pItem == handle) {
-            *pItem = (*pItem)->next;
-            task_free((void *)handle);
-        }
-        pItem = &(*pItem)->next;
+    if (!msg)
+        return;
+
+    if (msg->flags & MSG_SAFE_TO_FREE_FLAG) {
+        zjs_free(msg);
+    } else {
+        PRINT("zjs_aio_free_msg: error! do not free message\n");
     }
 }
 
-struct zjs_cb_list_item *zjs_aio_get_callback_item(uint32_t pin, const char *event_type)
-{
-    // calls the JS callback registered in the struct
-    struct zjs_cb_list_item **pItem = &zjs_cb_list;
-    while (*pItem) {
-        jerry_object_t *obj = (*pItem)->pin_obj;
-        uint32_t pin_val;
-        zjs_obj_get_uint32(obj, "pin", &pin_val);
+static bool zjs_aio_ipm_send_async(uint32_t type, uint32_t pin, void *data) {
+    zjs_ipm_message_t *msg = zjs_aio_alloc_msg();
+    msg->type = type;
+    msg->user_data = data;
+    msg->data.aio.pin = pin;
+    msg->data.aio.value = 0;
 
-        if (pin == pin_val) {
-            if (event_type == NULL ||
-                !strcmp((*pItem)->event_type, event_type)) {
-                return (*pItem);
-            }
-        }
-        pItem = &(*pItem)->next;
+    int success = zjs_ipm_send(MSG_ID_AIO, msg);
+    if (success != 0) {
+        PRINT("zjs_aio_ipm_send: failed to send message\n");
+        return false;
     }
 
-    return NULL;
+    zjs_aio_free_msg(msg);
+    return true;
 }
 
-static void zjs_aio_call_function(struct zjs_callback *cb)
+static bool zjs_aio_ipm_send_sync(zjs_ipm_message_t* send,
+                                  zjs_ipm_message_t* result) {
+    send->flags |= MSG_SYNC_FLAG;
+    send->user_data = (void *)result;
+    send->error_code = ERROR_IPM_NONE;
+
+    if (zjs_ipm_send(MSG_ID_AIO, send) != 0) {
+        PRINT("zjs_aio_ipm_send_sync: failed to send message\n");
+        return false;
+    }
+
+    // block until reply or timeout
+    if (!nano_sem_take(&aio_sem, ZJS_AIO_TIMEOUT_TICKS)) {
+        PRINT("zjs_aio_ipm_send_sync: ipm timed out\n");
+        return false;
+    }
+
+    return true;
+}
+
+static jerry_value_t zjs_aio_call_remote_function(zjs_ipm_message_t* send)
 {
-    // requires: called only from task context
-    //  effects: handles execution of the JS callback when ready
-    struct zjs_cb_list_item *mycb = CONTAINER_OF(cb, struct zjs_cb_list_item,
-                                                 zjs_cb);
-    jerry_value_t arg = jerry_create_number_value(mycb->value);
-    jerry_value_t rval = jerry_call_function(mycb->zjs_cb.js_callback, NULL, &arg, 1);
-    if (!jerry_value_is_error(rval))
-        jerry_release_value(rval);
-    jerry_release_object(mycb->zjs_cb.js_callback);
-    zjs_aio_callback_free((uintptr_t)mycb);
+    if (!send)
+        return zjs_error("zjs_aio_call_remote_function: invalid send message");
+
+    zjs_ipm_message_t reply;
+
+    bool success = zjs_aio_ipm_send_sync(send, &reply);
+    zjs_aio_free_msg(send);
+
+    if (!success) {
+        return zjs_error("zjs_aio_call_remote_function: ipm message failed or timed out!");
+    }
+
+    if (reply.error_code != ERROR_IPM_NONE) {
+        PRINT("error code: %lu\n", reply.error_code);
+        return zjs_error("zjs_aio_call_remote_function: error received");
+    }
+
+    uint32_t value = reply.data.aio.value;
+    return jerry_create_number(value);
 }
 
-static void zjs_aio_emit_event(struct zjs_callback *cb)
+static jerry_value_t *zjs_aio_pre_callback(void *h, uint32_t *argc)
 {
-    struct zjs_cb_list_item *mycb = CONTAINER_OF(cb, struct zjs_cb_list_item,
-                                                 zjs_cb);
-    jerry_value_t arg = jerry_create_number_value(mycb->value);
-    jerry_value_t rval = jerry_call_function(mycb->zjs_cb.js_callback, NULL, &arg, 1);
-    if (!jerry_value_is_error(rval))
-        jerry_release_value(rval);
+    // effects: sets up value argument for the callback
+    aio_handle_t *handle = (aio_handle_t *)h;
+    *argc = 1;
+    handle->jvalue = jerry_create_number(handle->value);
+    return &handle->jvalue;
 }
 
-int zjs_aio_ipm_send(uint32_t type, uint32_t pin, uint32_t value) {
-    struct zjs_ipm_message msg;
-    msg.block = false;
-    msg.type = type;
-    msg.pin = pin;
-    msg.value = value;
-    return zjs_ipm_send(MSG_ID_AIO, &msg, sizeof(msg));
+static void zjs_aio_free_callback(void *h, jerry_value_t *ret_val)
+{
+    // effects: post-callback handler to free up one-shot callback and handle
+    aio_handle_t *handle = (aio_handle_t *)h;
+    zjs_remove_callback(handle->callback_id);
+    zjs_aio_free_handle(handle);
 }
 
-int zjs_aio_ipm_send_blocking(uint32_t type, uint32_t pin, uint32_t value) {
-    struct zjs_ipm_message msg;
-    msg.block = true;
-    msg.type = type;
-    msg.pin = pin;
-    msg.value = value;
-    return zjs_ipm_send(MSG_ID_AIO, &msg, sizeof(msg));
-}
-
-// callback that gets updated of latest analog value from pin
-void ipm_msg_receive_callback(void *context, uint32_t id, volatile void *data)
+static void ipm_msg_receive_callback(void *context, uint32_t id,
+                                     volatile void *data)
 {
     if (id != MSG_ID_AIO)
         return;
 
-    struct zjs_ipm_message *msg = (struct zjs_ipm_message *) data;
+    zjs_ipm_message_t *msg = *(zjs_ipm_message_t **)data;
 
-    if (msg->type == TYPE_AIO_OPEN_SUCCESS) {
-        PRINT("pin %lu is opened\n", msg->pin);
-    } else if (msg->type == TYPE_AIO_PIN_READ_SUCCESS) {
-        if (msg->pin < A0 || msg->pin > A5) {
-            PRINT("X86 - pin #%lu out of range\n", msg->pin);
-            return;
-        }
+    if (msg->flags & MSG_SYNC_FLAG) {
+        zjs_ipm_message_t *result = (zjs_ipm_message_t*)msg->user_data;
+        // synchronous ipm, copy the results
+        if (result)
+            memcpy(result, msg, sizeof(zjs_ipm_message_t));
 
-        if (msg->block) {
-            pin_values[msg->pin-A0] = msg->value;
-        }
-        else {
-            struct zjs_cb_list_item *mycb = zjs_aio_get_callback_item(msg->pin, NULL);
-            if (mycb && mycb->zjs_cb.js_callback) {
-                // TODO: ensure that there is no outstanding callback of this
-                //   type or else we may be overwriting the value it should have
-                //   reported
-                mycb->value = (double)msg->value;
-                zjs_queue_callback(&mycb->zjs_cb);
-            }
-        }
-    } else if (msg->type == TYPE_AIO_PIN_SUBSCRIBE_SUCCESS) {
-        PRINT("subscribed to events on pin %lu\n", msg->pin);
-    } else if (msg->type == TYPE_AIO_PIN_UNSUBSCRIBE_SUCCESS) {
-        PRINT("unsubscribed to events on pin %lu\n", msg->pin);
-    } else if (msg->type == TYPE_AIO_PIN_EVENT_VALUE_CHANGE) {
-        struct zjs_cb_list_item *mycb = zjs_aio_get_callback_item(msg->pin, "change");
-        if (mycb && mycb->zjs_cb.js_callback) {
-            mycb->value = (double)msg->value;
-            zjs_queue_callback(&mycb->zjs_cb);
-        } else {
-            PRINT("onChange event callback not found\n");
-        }
-    } else if (msg->type == TYPE_AIO_OPEN_FAIL ||
-               msg->type == TYPE_AIO_PIN_READ_FAIL ||
-               msg->type == TYPE_AIO_PIN_SUBSCRIBE_FAIL) {
-        PRINT("Error - failed to perform operation %lu\n", msg->type);
-    } else {
-        PRINT("IPM message not handled %lu\n", msg->type);
-    }
-
-    if (msg->block) {
         // un-block sync api
-        isr_sem_give(SEM_AIO_BLOCK);
+        nano_isr_sem_give(&aio_sem);
+    } else {
+        // asynchronous ipm
+        aio_handle_t *handle = (aio_handle_t *)msg->user_data;
+        uint32_t pin_value = msg->data.aio.value;
+#ifdef DEBUG_BUILD
+        uint32_t pin = msg->data.aio.pin;
+#endif
+
+        switch(msg->type) {
+        case TYPE_AIO_PIN_READ:
+        case TYPE_AIO_PIN_EVENT_VALUE_CHANGE:
+            handle->value = (double)pin_value;
+            zjs_signal_callback(handle->callback_id);
+            break;
+        case TYPE_AIO_PIN_SUBSCRIBE:
+            DBG_PRINT("ipm_msg_receive_callback: subscribed to events on pin %lu\n", pin);
+            break;
+        case TYPE_AIO_PIN_UNSUBSCRIBE:
+            DBG_PRINT("ipm_msg_receive_callback: unsubscribed to events on pin %lu\n", pin);
+            break;
+
+        default:
+            PRINT("ipm_msg_receive_callback: IPM message not handled %lu\n", msg->type);
+        }
     }
 }
 
-jerry_object_t *zjs_aio_init()
+static jerry_value_t zjs_aio_pin_read(const jerry_value_t function_obj,
+                                      const jerry_value_t this,
+                                      const jerry_value_t argv[],
+                                      const jerry_length_t argc)
 {
-    zjs_ipm_init();
-    zjs_ipm_register_callback(MSG_ID_AIO, ipm_msg_receive_callback);
+    uint32_t device, pin;
+    zjs_obj_get_uint32(this, "device", &device);
+    zjs_obj_get_uint32(this, "pin", &pin);
 
-    // create global AIO object
-    jerry_object_t *aio_obj = jerry_create_object();
-    zjs_obj_add_function(aio_obj, zjs_aio_open, "open");
-    return aio_obj;
-}
-
-bool zjs_aio_open(const jerry_object_t *function_obj_p,
-                  const jerry_value_t this_val,
-                  const jerry_value_t args_p[],
-                  const jerry_length_t args_cnt,
-                  jerry_value_t *ret_val_p)
-{
-    if (args_cnt < 1 || !jerry_value_is_object(args_p[0])) {
-        PRINT("zjs_aio_open: invalid arguments\n");
-        return false;
+    if (pin < ARC_AIO_MIN || pin > ARC_AIO_MAX) {
+        DBG_PRINT("PIN: #%lu\n", pin);
+        return zjs_error("zjs_aio_pin_read: pin out of range");
     }
 
-    jerry_object_t *data = jerry_get_object_value(args_p[0]);
+    // send IPM message to the ARC side
+    zjs_ipm_message_t* send = zjs_aio_alloc_msg();
+    send->type = TYPE_AIO_PIN_READ;
+    send->data.aio.pin = pin;
 
-    uint32_t device;
-    if (!zjs_obj_get_uint32(data, "device", &device)) {
-        PRINT("zjs_aio_open: missing required field (device)\n");
-        return false;
+    jerry_value_t result = zjs_aio_call_remote_function(send);
+    return result;
+}
+
+static jerry_value_t zjs_aio_pin_close(const jerry_value_t function_obj,
+                                       const jerry_value_t this,
+                                       const jerry_value_t argv[],
+                                       const jerry_length_t argc)
+{
+    uint32_t pin;
+    zjs_obj_get_uint32(this, "pin", &pin);
+
+    aio_handle_t* handle;
+    if (jerry_get_object_native_handle(this, (uintptr_t*)&handle) && handle) {
+        // remove existing onchange handler and unsubscribe
+        zjs_aio_ipm_send_async(TYPE_AIO_PIN_UNSUBSCRIBE, pin, handle);
+        zjs_remove_callback(handle->callback_id);
+        jerry_set_object_native_handle(this, 0, NULL);
+        zjs_aio_free_handle(handle);
+    }
+
+    return ZJS_UNDEFINED;
+}
+
+static jerry_value_t zjs_aio_pin_on(const jerry_value_t function_obj,
+                                    const jerry_value_t this,
+                                    const jerry_value_t argv[],
+                                    const jerry_length_t argc)
+{
+    if (argc < 2 ||
+        !jerry_value_is_string(argv[0]) ||
+        (!jerry_value_is_function(argv[1]) &&
+         !jerry_value_is_null(argv[1]))) {
+        return zjs_error("zjs_aio_pin_on: invalid argument");
     }
 
     uint32_t pin;
-    if (!zjs_obj_get_uint32(data, "pin", &pin)) {
-        PRINT("zjs_aio_open: missing required field (pin)\n");
-        return false;
+    zjs_obj_get_uint32(this, "pin", &pin);
+
+    char event[MAX_TYPE_LEN];
+    jerry_value_t arg = argv[0];
+    jerry_size_t sz = jerry_get_string_size(arg);
+    if (sz >= MAX_TYPE_LEN)
+        return zjs_error("zjs_aio_pin_on: event string too long");
+    int len = jerry_string_to_char_buffer(arg, (jerry_char_t *)event, sz);
+    event[len] = '\0';
+
+    if (strcmp(event, "change"))
+        return zjs_error("zjs_aio_pin_on: unsupported event type");
+
+    aio_handle_t* handle;
+    if (jerry_get_object_native_handle(this, (uintptr_t*)&handle) && handle) {
+        if (jerry_value_is_null(argv[1])) {
+            // no change function, remove if one existed before
+            zjs_aio_ipm_send_async(TYPE_AIO_PIN_UNSUBSCRIBE, pin, handle);
+            zjs_remove_callback(handle->callback_id);
+            jerry_set_object_native_handle(this, 0, NULL);
+            zjs_aio_free_handle(handle);
+        } else {
+            // switch to new change function
+            zjs_edit_js_func(handle->callback_id, argv[1]);
+        }
+    } else if (!jerry_value_is_null(argv[1])) {
+        // new change function
+        handle = zjs_aio_alloc_handle();
+        if (!handle)
+            return zjs_error("zjs_aio_pin_on: could not allocate handle");
+
+        handle->pin_obj = this;
+        jerry_set_object_native_handle(this, (uintptr_t)handle, NULL);
+        handle->callback_id = zjs_add_callback(argv[1], this, handle,
+                                               zjs_aio_pre_callback, NULL);
+        zjs_aio_ipm_send_async(TYPE_AIO_PIN_SUBSCRIBE, pin, handle);
     }
+
+    return ZJS_UNDEFINED;
+}
+
+// Asynchronous Operations
+static jerry_value_t zjs_aio_pin_read_async(const jerry_value_t function_obj,
+                                            const jerry_value_t this,
+                                            const jerry_value_t argv[],
+                                            const jerry_length_t argc)
+{
+    if (argc < 1 || !jerry_value_is_function(argv[0]))
+        return zjs_error("zjs_aio_pin_read_async: invalid argument");
+
+    uint32_t device, pin;
+    zjs_obj_get_uint32(this, "device", &device);
+    zjs_obj_get_uint32(this, "pin", &pin);
+
+    aio_handle_t *handle = zjs_aio_alloc_handle();
+    if (!handle)
+        return zjs_error("zjs_aio_pin_read_async: could not allocate handle");
+
+    handle->pin_obj = this;
+    handle->callback_id = zjs_add_callback(argv[0], this, handle,
+                                           zjs_aio_pre_callback,
+                                           zjs_aio_free_callback);
+
+    // send IPM message to the ARC side; response will come on an ISR
+    zjs_aio_ipm_send_async(TYPE_AIO_PIN_READ, pin, handle);
+    return ZJS_UNDEFINED;
+}
+
+static jerry_value_t zjs_aio_open(const jerry_value_t function_obj,
+                                  const jerry_value_t this,
+                                  const jerry_value_t argv[],
+                                  const jerry_length_t argc)
+{
+    if (argc < 1 || !jerry_value_is_object(argv[0]))
+        return zjs_error("zjs_aio_open: invalid argument");
+
+    jerry_value_t data = argv[0];
+
+    uint32_t device;
+    if (!zjs_obj_get_uint32(data, "device", &device))
+        return zjs_error("zjs_aio_open: missing required field (device)");
+
+    uint32_t pin;
+    if (!zjs_obj_get_uint32(data, "pin", &pin))
+        return zjs_error("zjs_aio_open: missing required field (pin)");
 
     const int BUFLEN = 32;
     char buffer[BUFLEN];
@@ -238,18 +341,18 @@ bool zjs_aio_open(const jerry_object_t *function_obj_p,
     zjs_obj_get_boolean(data, "raw", &raw);
 
     // send IPM message to the ARC side
-    zjs_aio_ipm_send_blocking(TYPE_AIO_OPEN, pin, 0);
-    // block until reply or timeout
-    if (task_sem_take(SEM_AIO_BLOCK, 500) == RC_TIME) {
-        PRINT("Reply from ARC timed out!");
-        return false;
-    }
+    zjs_ipm_message_t* send = zjs_aio_alloc_msg();
+    send->type = TYPE_AIO_OPEN;
+    send->data.aio.pin = pin;
+
+    jerry_value_t result = zjs_aio_call_remote_function(send);
+    if (jerry_value_has_error_flag(result))
+        return result;
 
     // create the AIOPin object
-    jerry_object_t *pinobj = jerry_create_object();
+    jerry_value_t pinobj = jerry_create_object();
     zjs_obj_add_function(pinobj, zjs_aio_pin_read, "read");
-    zjs_obj_add_function(pinobj, zjs_aio_pin_read_async, "read_async");
-    zjs_obj_add_function(pinobj, zjs_aio_pin_abort, "abort");
+    zjs_obj_add_function(pinobj, zjs_aio_pin_read_async, "readAsync");
     zjs_obj_add_function(pinobj, zjs_aio_pin_close, "close");
     zjs_obj_add_function(pinobj, zjs_aio_pin_on, "on");
     zjs_obj_add_string(pinobj, name, "name");
@@ -257,145 +360,21 @@ bool zjs_aio_open(const jerry_object_t *function_obj_p,
     zjs_obj_add_number(pinobj, pin, "pin");
     zjs_obj_add_boolean(pinobj, raw, "raw");
 
-    *ret_val_p = jerry_create_object_value(pinobj);
-    return true;
+    return pinobj;
 }
 
-bool zjs_aio_pin_read(const jerry_object_t *function_obj_p,
-                      const jerry_value_t this_val,
-                      const jerry_value_t args_p[],
-                      const jerry_length_t args_cnt,
-                      jerry_value_t *ret_val_p)
+jerry_value_t zjs_aio_init()
 {
-    jerry_object_t *obj = jerry_get_object_value(this_val);
+    zjs_ipm_init();
+    zjs_ipm_register_callback(MSG_ID_AIO, ipm_msg_receive_callback);
 
-    uint32_t device, pin;
-    zjs_obj_get_uint32(obj, "device", &device);
-    zjs_obj_get_uint32(obj, "pin", &pin);
+    nano_sem_init(&aio_sem);
 
-    if (pin < A0 || pin > A5) {
-        PRINT("pin #%lu out of range\n", pin);
-        return false;
-    }
-
-    // send IPM message to the ARC side
-    zjs_aio_ipm_send_blocking(TYPE_AIO_PIN_READ, pin, 0);
-    // block until reply or timeout
-    if (task_sem_take(SEM_AIO_BLOCK, 500) == RC_TIME) {
-        PRINT("Reply from ARC timed out!");
-        return false;
-    }
-
-    double value;
-    value = (double) pin_values[pin-A0];
-
-    *ret_val_p = jerry_create_number_value(value);
-    return true;
+    // create global AIO object
+    jerry_value_t aio_obj = jerry_create_object();
+    zjs_obj_add_function(aio_obj, zjs_aio_open, "open");
+    return aio_obj;
 }
 
-bool zjs_aio_pin_abort(const jerry_object_t *function_obj_p,
-                       const jerry_value_t this_val,
-                       const jerry_value_t args_p[],
-                       const jerry_length_t args_cnt,
-                       jerry_value_t *ret_val_p)
-{
-    // NO-OP
-    return true;
-}
-
-bool zjs_aio_pin_close(const jerry_object_t *function_obj_p,
-                       const jerry_value_t this_val,
-                       const jerry_value_t args_p[],
-                       const jerry_length_t args_cnt,
-                       jerry_value_t *ret_val_p)
-{
-    // NO-OP
-    return true;
-}
-
-bool zjs_aio_pin_on(const jerry_object_t *function_obj_p,
-                    const jerry_value_t this_val,
-                    const jerry_value_t args_p[],
-                    const jerry_length_t args_cnt,
-                    jerry_value_t *ret_val_p)
-{
-    if (args_cnt < 2 ||
-        !jerry_value_is_string(args_p[0]) ||
-        (!jerry_value_is_object(args_p[1]) &&
-         !jerry_value_is_null(args_p[1]))) {
-        PRINT("zjs_aio_pin_on: invalid arguments\n");
-        return true;
-    }
-
-    jerry_object_t *obj = jerry_get_object_value(this_val);
-
-    uint32_t pin;
-    zjs_obj_get_uint32(obj, "pin", &pin);
-
-    char event[20];
-    jerry_value_t arg = args_p[0];
-    jerry_size_t sz = jerry_get_string_size(jerry_get_string_value(arg));
-    int len = jerry_string_to_char_buffer(jerry_get_string_value(arg),
-                                          (jerry_char_t *)event,
-                                          sz);
-    event[len] = '\0';
-
-    struct zjs_cb_list_item *item = zjs_aio_get_callback_item(pin, event);
-    if (!item) {
-        item = zjs_aio_callback_alloc();
-    }
-
-    if (!item)
-        return false;
-
-    item->pin_obj = obj;
-    item->zjs_cb.js_callback = jerry_acquire_object(jerry_get_object_value(args_p[1]));
-    item->zjs_cb.call_function = zjs_aio_emit_event;
-    memcpy(item->event_type, event, len);
-
-    if (!strcmp(event, "change")) {
-        if (jerry_value_is_object(args_p[1])) {
-            zjs_aio_ipm_send(TYPE_AIO_PIN_SUBSCRIBE, pin, 0);
-        } else {
-            zjs_aio_ipm_send(TYPE_AIO_PIN_UNSUBSCRIBE, pin, 0);
-        }
-    }
-
-    return true;
-}
-
-// Asynchrounous Operations
-bool zjs_aio_pin_read_async(const jerry_object_t *function_obj_p,
-                            const jerry_value_t this_val,
-                            const jerry_value_t args_p[],
-                            const jerry_length_t args_cnt,
-                            jerry_value_t *ret_val_p)
-{
-    if (args_cnt < 1 || !jerry_value_is_function(args_p[0])) {
-        PRINT("zjs_aio_pin_read_async: invalid argument\n");
-        return false;
-    }
-
-    jerry_object_t *obj = jerry_get_object_value(this_val);
-    uint32_t device, pin;
-    zjs_obj_get_uint32(obj, "device", &device);
-    zjs_obj_get_uint32(obj, "pin", &pin);
-
-    struct zjs_cb_list_item *item = zjs_aio_get_callback_item(pin, NULL);
-    if (!item) {
-        item = zjs_aio_callback_alloc();
-    }
-
-    if (!item)
-        return false;
-
-    item->pin_obj = obj;
-    item->zjs_cb.js_callback = jerry_get_object_value(args_p[0]);
-    item->zjs_cb.call_function = zjs_aio_call_function;
-
-    jerry_acquire_object(item->zjs_cb.js_callback);
-
-    // send IPM message to the ARC side and wait for reponse
-    zjs_aio_ipm_send(TYPE_AIO_PIN_READ, pin, 0);
-    return true;
-}
+#endif // QEMU_BUILD
+#endif // BUILD_MODULE_AIO

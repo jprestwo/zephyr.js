@@ -3,26 +3,57 @@
 // Test code for Arduino 101 that replicates the WebBluetooth demo
 // using BLE to advertise temperature changes and allow LED color changes
 
-// import aio and ble module
+// Hardware Requirements:
+//   - A temperature sensor (TMP36)
+//   - A color LED bulb
+//   - 200-ohm resisters
+// Wiring:
+//   For the temperature sensor:
+//     - Wire the device's power to Arduino 3.3V and ground to GND
+//     - Wire the signal pin to Arduino A0
+//   For the color LED bulb:
+//     - The LED has 4 legs, wire the longest one to the ground
+//     - Wire the other 3 legs to 220-ohm resisters that connect to the
+//         three PWM pins (IO3, IO5, IO6)
+
 var aio = require("aio");
 var ble = require("ble");
 var pwm = require("pwm");
 var pins = require("arduino101_pins");
 
-DEVICE_NAME = 'Arduino101';
+var DEVICE_NAME = 'Arduino101';
 
 var TemperatureCharacteristic = new ble.Characteristic({
     uuid: 'fc0a',
     properties: ['read', 'notify'],
-    value: null
+    descriptors: [
+        new ble.Descriptor({
+            uuid: '2901',
+            value: 'Temperature'
+        })
+    ]
 });
 
 TemperatureCharacteristic._lastValue = undefined;
 TemperatureCharacteristic._onChange = null;
 
-var pinA0 = aio.open({ device: 0, pin: 10 });
+var tmp36 = aio.open({ device: 0, pin: pins.A0 });
 
 TemperatureCharacteristic.onReadRequest = function(offset, callback) {
+    if (!this._lastValue) {
+        var rawValue = pinA0.read();
+        if (rawValue == 0) {
+            print("PinA: invalid temperature value");
+            callback(this.RESULT_UNLIKELY_ERROR, null);
+            return;
+        }
+
+        var voltage = (rawValue / 4096.0) * 3.3;
+        var celsius = (voltage - 0.5) * 100 + 0.5;
+        this._lastValue = celsius;
+    }
+
+    print("Temperature: " + this._lastValue);
     var data = new Buffer(1);
     data.writeUInt8(this._lastValue);
     callback(this.RESULT_SUCCESS, data);
@@ -54,23 +85,32 @@ TemperatureCharacteristic.valueChange = function(value) {
 var ColorCharacteristic = new ble.Characteristic({
     uuid: 'fc0b',
     properties: ['read', 'write'],
-    value: null
+    descriptors: [
+        new ble.Descriptor({
+            uuid: '2901',
+            value: 'LED'
+        })
+    ]
 });
 
-// default color
+// Default color: red.
 ColorCharacteristic._value = new Buffer(3);
 ColorCharacteristic._value.writeUInt8(255, 0);
 ColorCharacteristic._value.writeUInt8(0, 1);
 ColorCharacteristic._value.writeUInt8(0, 2);
-ColorCharacteristic.ledR = pwm.open({channel: pins.IO3, period: 0.256,
-                                     pulseWidth: 0.128});
-ColorCharacteristic.ledG = pwm.open({channel: pins.IO5, period: 0.256,
-                                     pulseWidth: 0});
-ColorCharacteristic.ledB = pwm.open({channel: pins.IO6, period: 0.256,
-                                     pulseWidth: 0});
+
+ColorCharacteristic.ledR = pwm.open({
+    channel: pins.IO3, period: 0.256, pulseWidth: 255 / 1000
+});
+ColorCharacteristic.ledG = pwm.open({
+    channel: pins.IO5, period: 0.256, pulseWidth: 0
+});
+ColorCharacteristic.ledB = pwm.open({
+    channel: pins.IO6, period: 0.256, pulseWidth: 0
+});
 
 ColorCharacteristic.onReadRequest = function(offset, callback) {
-    print("led value: " + this._value.toString('hex'));
+    print("Color change: #" + this._value.toString('hex'));
     callback(this.RESULT_SUCCESS, this._value);
 };
 
@@ -92,18 +132,16 @@ ColorCharacteristic.onWriteRequest = function(data, offset, withoutResponse,
     this.ledR.setPulseWidth(this._value.readUInt8(0) / 1000);
     this.ledG.setPulseWidth(this._value.readUInt8(1) / 1000);
     this.ledB.setPulseWidth(this._value.readUInt8(2) / 1000);
+    // TODO: probably only supposed to call this if withoutResponse is false?
     callback(this.RESULT_SUCCESS);
 };
 
 ble.on('stateChange', function(state) {
-    print(state);
-
     if (state === 'poweredOn') {
-        print("POWERED ON")
-        ble.startAdvertising(DEVICE_NAME, ['fc00'], "https://goo.gl/9FomQC");
+        ble.startAdvertising(DEVICE_NAME, ['fc00'], "https://goo.gl/QEvyDZ");
     } else {
-        if (state === 'unsupported'){
-            print("BLE and Bleno configurations not enabled on board");
+        if (state === 'unsupported') {
+            print("BLE not enabled on board");
         }
         ble.stopAdvertising();
     }
@@ -130,11 +168,12 @@ ble.on('advertisingStart', function(error) {
 ble.on('accept', function(clientAddress) {
     print("Accepted Connection: " + clientAddress);
 
-    pinA0.on("change", function(data) {
+    tmp36.on("change", function(data) {
         var voltage = (data / 4096.0) * 3.3;
         var celsius = (voltage - 0.5) * 100 + 0.5;
+        celsius = celsius | 0;
 
-        print("Temperature change " + celsius);
+        print("Temperature change: " + celsius + " degrees Celsius");
         TemperatureCharacteristic.valueChange(celsius);
     });
 });
@@ -142,7 +181,7 @@ ble.on('accept', function(clientAddress) {
 ble.on('disconnect', function(clientAddress) {
     print("Disconnected Connection: " + clientAddress);
 
-    pinA0.on("change", null);
+    tmp36.on("change", null);
 });
 
 print("WebBluetooth Demo with BLE...");

@@ -1,5 +1,5 @@
 if [ "X$(basename -z -- "$0")" "==" "Xzjs-env.sh" ]; then
-    echo "Source this file (do NOT execute it!) to set up the Zephyr JS dev environment."
+    echo "Source this file (do NOT execute it!) to set up the ZJS dev environment."
     exit
 fi
 
@@ -22,10 +22,9 @@ export ZJS_BASE=$( builtin cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 echo ZJS_BASE: $ZJS_BASE
 
 # identify JerryScript source tree root directory
-if [ "X$JERRY_BASE" == "X" ]; then
-    export JERRY_BASE=$ZJS_BASE/deps/jerryscript
+if [ "X$JERRY_BASE" != "X" ]; then
+    echo JERRY_BASE: $JERRY_BASE
 fi
-echo JERRY_BASE: $JERRY_BASE
 
 # add scripts/ subdirectory to PATH
 scripts_path=${ZJS_BASE}/scripts

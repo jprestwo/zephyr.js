@@ -1,92 +1,144 @@
 // Copyright (c) 2016, Intel Corporation.
 
+#ifndef ZJS_LINUX_BUILD
 // Zephyr includes
 #include <zephyr.h>
+#endif
 #include <string.h>
 #include <stdlib.h>
 
 // ZJS includes
+#include "zjs_event.h"
 #include "zjs_modules.h"
 #include "zjs_util.h"
+#ifdef BUILD_MODULE_OCF
+#include "zjs_ocf_common.h"
+#endif
+#ifndef ZJS_LINUX_BUILD
+// ZJS includes
+#include "zjs_aio.h"
+#include "zjs_ble.h"
+#include "zjs_gpio.h"
+#include "zjs_grove_lcd.h"
+#include "zjs_pwm.h"
+#include "zjs_i2c.h"
+#ifdef CONFIG_BOARD_ARDUINO_101
+#include "zjs_a101_pins.h"
+#endif // ZJS_LINUX_BUILD
+#ifdef CONFIG_BOARD_FRDM_K64F
+#include "zjs_k64f_pins.h"
+#endif
+#endif
 
-struct modItem {
+typedef struct module {
     const char *name;
-    InitCB init;
-    struct modItem *next;
+    initcb_t init;
+} module_t;
+
+module_t zjs_modules_array[] = {
+#ifndef ZJS_LINUX_BUILD
+#ifndef QEMU_BUILD
+#ifndef CONFIG_BOARD_FRDM_K64F
+#ifdef BUILD_MODULE_AIO
+    { "aio", zjs_aio_init },
+#endif
+#endif
+#ifdef BUILD_MODULE_BLE
+    { "ble", zjs_ble_init },
+#endif
+#ifdef BUILD_MODULE_GPIO
+    { "gpio", zjs_gpio_init },
+#endif
+#ifdef BUILD_MODULE_GROVE_LCD
+    { "grove_lcd", zjs_grove_lcd_init },
+#endif
+#ifdef BUILD_MODULE_PWM
+    { "pwm", zjs_pwm_init },
+#endif
+#ifdef BUILD_MODULE_I2C
+    { "i2c", zjs_i2c_init },
+#endif
+#ifdef CONFIG_BOARD_ARDUINO_101
+#ifdef BUILD_MODULE_A101
+    { "arduino101_pins", zjs_a101_init },
+#endif
+#endif
+#ifdef CONFIG_BOARD_FRDM_K64F
+    { "k64f_pins", zjs_k64f_init },
+#endif
+#endif // QEMU_BUILD
+#endif // ZJS_LINUX_BUILD
+#ifdef BUILD_MODULE_EVENTS
+    { "events", zjs_event_init },
+#endif
+#ifdef BUILD_MODULE_OCF
+    { "ocf", zjs_ocf_init }
+#endif
 };
 
-static struct modItem *modList;
+struct routine_map {
+    zjs_service_routine func;
+    void* handle;
+};
 
-static bool
-native_require_handler(const jerry_object_t *function_obj_p,
-                       const jerry_value_t this_val,
-                       const jerry_value_t args_p[],
-                       const jerry_length_t args_cnt,
-                       jerry_value_t *ret_val_p)
+static uint8_t num_routines = 0;
+struct routine_map svc_routine_map[NUM_SERVICE_ROUTINES];
+
+static jerry_value_t native_require_handler(const jerry_value_t function_obj,
+                                            const jerry_value_t this,
+                                            const jerry_value_t argv[],
+                                            const jerry_length_t argc)
 {
-    char module[80];
-    jerry_size_t sz;
-
-    jerry_value_t arg = args_p[0];
+    jerry_value_t arg = argv[0];
     if (!jerry_value_is_string(arg)) {
-        PRINT ("native_require_handler: invalid arguments\n");
-        return false;
+        return zjs_error("native_require_handler: invalid argument");
     }
 
-    sz = jerry_get_string_size(jerry_get_string_value(arg));
-    int len = jerry_string_to_char_buffer(jerry_get_string_value(arg),
-                                          (jerry_char_t *)module,
-                                          sz);
+    const int maxlen = 32;
+    char module[maxlen];
+    jerry_size_t sz = jerry_get_string_size(arg);
+    if (sz >= maxlen) {
+        return zjs_error("native_require_handler: argument too long");
+    }
+    int len = jerry_string_to_char_buffer(arg, (jerry_char_t *)module, sz);
     module[len] = '\0';
 
-
-    if (modList) {
-        struct modItem *t = modList;
-        while (t) {
-            if (!strcmp(t->name, module)) {
-                jerry_object_t *obj = t->init();
-                zjs_init_value_object(ret_val_p, obj);
-                return true;
-            }
-            t = t->next;
+    int modcount = sizeof(zjs_modules_array) / sizeof(module_t);
+    for (int i = 0; i < modcount; i++) {
+        module_t *mod = &zjs_modules_array[i];
+        if (!strcmp(mod->name, module)) {
+            return jerry_acquire_value(mod->init());
         }
     }
 
-    // Module is not in our list if it gets to this point.
-    PRINT("Error: module `%s'  not found\n", module);
-    zjs_init_value_object(ret_val_p, 0);
-
-    return false;
+    PRINT("MODULE: `%s'\n", module);
+    return zjs_error("native_require_handler: module not found");
 }
 
 void zjs_modules_init()
 {
-    jerry_object_t *global_obj = jerry_get_global();
+    jerry_value_t global_obj = jerry_get_global_object();
 
     // create the C handler for require JS call
     zjs_obj_add_function(global_obj, native_require_handler, "require");
 }
 
-void zjs_modules_add(const char *name, InitCB cb)
+void zjs_register_service_routine(void* handle, zjs_service_routine func)
 {
-    struct modItem *item = (struct modItem *)task_malloc(sizeof(struct modItem));
-    if (!item) {
-        PRINT("Error: out of memory!\n");
-        exit(1);
-    }
-
-    item->name = name;
-    item->init = cb;
-    item->next = NULL;
-
-    if (!modList) {
-        modList = item;
+    if (num_routines >= NUM_SERVICE_ROUTINES) {
+        DBG_PRINT(("not enough space, increase NUM_SERVICE_ROUTINES\n"));
         return;
     }
+    svc_routine_map[num_routines].handle = handle;
+    svc_routine_map[num_routines].func = func;
+    num_routines++;
+    return;
+}
 
-    struct modItem *t = modList;
-    while (t->next)
-        t = t->next;
-
-    t->next = item;
+void zjs_service_routines(void)
+{
+    int i;
+    for (i = 0; i < num_routines; ++i) {
+        svc_routine_map[i].func(svc_routine_map[i].handle);
+    }
 }

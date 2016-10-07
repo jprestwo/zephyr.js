@@ -1,0 +1,52 @@
+JERRY_BASE ?= $(ZJS_BASE)/deps/jerryscript
+
+ccflags-y += -Wall -Werror
+
+ccflags-y += -I$(JERRY_BASE)/jerry-core
+ccflags-y += -I$(ZEPHYR_BASE)/drivers
+ccflags-y += -I$(ZJS_BASE)/outdir/include
+
+ifeq ($(VARIANT), debug)
+ccflags-y += -DDEBUG_BUILD
+endif
+
+ifeq ($(BOARD), qemu_x86)
+ccflags-y += -DQEMU_BUILD
+endif
+
+obj-y += main.o \
+         zjs_ble.o \
+         zjs_buffer.o \
+         zjs_callbacks.o \
+         zjs_event.o \
+         zjs_gpio.o \
+         zjs_modules.o \
+         zjs_promise.o \
+         zjs_pwm.o \
+         zjs_script.o \
+         zjs_script_gen.o \
+         zjs_timers.o \
+         zjs_util.o
+
+# skip for now for frdm_k64f
+ifneq ($(BOARD), frdm_k64f)
+obj-y += zjs_aio.o \
+         zjs_i2c.o \
+         zjs_grove_lcd.o
+endif
+
+obj-$(CONFIG_BOARD_ARDUINO_101) += \
+	zjs_a101_pins.o \
+	zjs_ipm.o
+
+obj-$(CONFIG_BOARD_FRDM_K64F) += \
+	zjs_k64f_pins.o
+
+ifeq ($(DEV), ashell)
+$(info Insecure Mode (development))
+ccflags-y += -DBUILD_MODULE_GPIO -DBUILD_MODULE_PWM -DBUILD_MODULE_UART
+ccflags-y += -DBUILD_MODULE_BLE -DBUILD_MODULE_AIO -DBUILD_MODULE_A101
+ccflags-y += -DBUILD_MODULE_TIMER -DBUILD_MODULE_BUFFER
+export JERRY_INCLUDE = $(JERRY_BASE)/jerry-core/
+obj-y += ashell/
+endif
